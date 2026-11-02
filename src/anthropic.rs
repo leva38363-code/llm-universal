@@ -134,7 +134,12 @@ impl AnthropicProvider {
             "messages": messages,
         });
         if !system_parts.is_empty() {
-            body["system"] = json!(system_parts.join("\n\n"));
+            let text = system_parts.join("\n\n");
+            body["system"] = if req.cache_system {
+                json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }])
+            } else {
+                json!(text)
+            };
         }
         if !req.tools.is_empty() {
             let tools: Vec<Value> = req
@@ -688,5 +693,21 @@ mod regression_tests {
             r#"{"type":"message_delta","delta":{},"usage":{"output_tokens":3}}"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn cache_system_marks_system_block() {
+        let req = ChatRequest::new("m").system("длинный промпт").cache_system().message(Message::user("hi"));
+        let body = AnthropicProvider::build_body(&req);
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["text"], "длинный промпт");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn system_is_plain_string_by_default() {
+        let req = ChatRequest::new("m").system("sys").message(Message::user("hi"));
+        let body = AnthropicProvider::build_body(&req);
+        assert_eq!(body["system"], "sys");
     }
 }

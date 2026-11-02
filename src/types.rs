@@ -232,6 +232,9 @@ pub struct ChatRequest {
     pub response_format: Option<ResponseFormat>,
     /// Reasoning effort / thinking. Reasoning comes back as [`Part::Reasoning`].
     pub reasoning: Option<ReasoningEffort>,
+    /// Anthropic only: mark the system prompt for prompt caching (`cache_control: ephemeral`).
+    /// Ignored by other providers. Off by default.
+    pub cache_system: bool,
 }
 
 /// `max_tokens` sent to Anthropic when the request does not set one.
@@ -243,6 +246,12 @@ impl ChatRequest {
             model: model.into(),
             ..Default::default()
         }
+    }
+
+    /// Anthropic: cache the system prompt between requests (cheaper for long, repeated prompts).
+    pub fn cache_system(mut self) -> Self {
+        self.cache_system = true;
+        self
     }
 
     pub fn system(mut self, system: impl Into<String>) -> Self {
