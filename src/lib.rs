@@ -37,6 +37,7 @@
 mod anthropic;
 mod cohere;
 mod error;
+mod fallback;
 mod gemini;
 mod http;
 mod openai;
@@ -47,6 +48,7 @@ mod types;
 pub use anthropic::AnthropicProvider;
 pub use cohere::CohereProvider;
 pub use error::{ApiError, ApiErrorKind, LlmError};
+pub use fallback::FallbackProvider;
 pub use futures_util::StreamExt;
 pub use gemini::GeminiProvider;
 pub use http::DEFAULT_MAX_RETRIES;

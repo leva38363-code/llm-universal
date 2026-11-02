@@ -165,6 +165,21 @@ println!("{} — {}", city.name, city.population);
 # Ok(()) }
 ```
 
+## Fallback
+
+Opt-in: nothing changes unless you build a `FallbackProvider` yourself. It tries providers in order
+and moves on only on errors worth retrying elsewhere (network, timeout, 408/409/429, 5xx).
+Auth and bad-request errors are returned at once.
+
+```rust,ignore
+use llm_universal::{FallbackProvider, LlmProvider, OpenAiProvider, AnthropicProvider};
+
+let chain = FallbackProvider::new(vec![
+    Box::new(AnthropicProvider::new(anthropic_key)),
+    Box::new(OpenAiProvider::new(openai_key)),
+]).expect("at least one provider");
+```
+
 ## Errors
 
 | `LlmError` variant | When | SDK equivalent |
