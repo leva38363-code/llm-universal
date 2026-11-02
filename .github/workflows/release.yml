@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Упаковать crate
-        run: cargo package --no-verify
+        run: cargo package --no-verify --allow-dirty
       - name: Посчитать хеши
         id: hash
         working-directory: target/package
