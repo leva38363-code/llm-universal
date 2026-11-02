@@ -42,6 +42,7 @@ mod gemini;
 mod http;
 mod openai;
 mod runner;
+mod sigv4;
 mod stream;
 mod types;
 
