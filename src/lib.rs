@@ -110,6 +110,11 @@ fn checked_host<'a>(provider: &str, base_url: &'a str) -> Result<&'a str> {
                 "{provider}: base_url must start with http:// or https://"
             ))
         })?;
+    if base_url.chars().any(|c| c == '\\' || c.is_whitespace() || c.is_control()) {
+        return Err(invalid(format!(
+            "{provider}: base_url must not contain backslashes, spaces or control characters"
+        )));
+    }
     let authority = rest.split('/').next().unwrap_or_default();
     if authority.contains('@') || base_url.contains('?') || base_url.contains('#') {
         // Credentials in the URL would leak into logs and error chains.
@@ -123,13 +128,21 @@ fn checked_host<'a>(provider: &str, base_url: &'a str) -> Result<&'a str> {
     Ok(authority)
 }
 
-fn is_loopback(authority: &str) -> bool {
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split(']').next().unwrap_or_default()
-    } else {
-        authority.split(':').next().unwrap_or_default()
+/// True only when the URL's real host (as reqwest will resolve it) is loopback.
+/// The host comes from the same parser reqwest uses, so tricks like `127.evil.com`
+/// or `evil.com\.localhost` cannot pass as local.
+fn is_loopback(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
     };
-    host == "localhost" || host.ends_with(".localhost") || host == "::1" || host.starts_with("127.")
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
 }
 
 /// Checks `base_url` and the key's transport before any request.
@@ -139,8 +152,8 @@ pub(crate) fn validate_endpoint(
     require_key: bool,
     base_url: &str,
 ) -> Result<()> {
-    let authority = checked_host(provider, base_url)?;
-    if base_url.starts_with("http://") && !api_key.is_empty() && !is_loopback(authority) {
+    checked_host(provider, base_url)?;
+    if base_url.starts_with("http://") && !api_key.is_empty() && !is_loopback(base_url) {
         return Err(invalid(format!(
             "{provider}: refusing to send an API key over plain http:// to a non-local host; use https://"
         )));

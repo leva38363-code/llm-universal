@@ -120,3 +120,30 @@ async fn vertex_rejects_dot_segments() {
     let msg = invalid_args(&p, hi()).await;
     assert!(msg.contains("project"), "{msg}");
 }
+
+/// Регрессия пентеста: ключ не должен уходить по http:// на хост, который только похож на локальный.
+#[tokio::test]
+async fn lookalike_local_hosts_do_not_get_the_key_over_http() {
+    for url in [
+        "http://127.attacker.example/v1",
+        "http://127.0.0.1.nip.io/v1",
+        "http://evil.com\\.localhost/v1",
+        "http://evil.localhost.attacker.example/v1",
+        "http://x.localhost/v1",
+        "http://evil.com /v1",
+    ] {
+        let p = OpenAiProvider::new("sk-SECRET").with_base_url(url);
+        let msg = invalid_args(&p, hi()).await;
+        assert!(!msg.contains("sk-SECRET"), "{url}: {msg}");
+    }
+}
+
+/// Настоящие локальные адреса по-прежнему разрешены: ошибка будет сетевой, а не отказ валидации.
+#[tokio::test]
+async fn real_loopback_hosts_still_allowed_over_http() {
+    for url in ["http://localhost:9/v1", "http://127.0.0.1:9/v1", "http://[::1]:9/v1", "http://LOCALHOST:9/v1"] {
+        let p = OpenAiProvider::new("sk-x").with_base_url(url).with_max_retries(0);
+        let err = p.chat(&hi()).await.unwrap_err();
+        assert!(!matches!(err, LlmError::InvalidArgument(_)), "{url}: {err}");
+    }
+}

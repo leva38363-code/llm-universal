@@ -33,8 +33,9 @@ pub struct Signing<'a> {
 }
 
 #[allow(dead_code)] // подключается к провайдеру Bedrock отдельным шагом
-/// Returns the `Authorization` header value for a request.
-pub fn authorization(input: &Signing<'_>) -> String {
+/// Returns the `Authorization` header value, or `None` if the input is malformed
+/// (`amz_date` not `YYYYMMDDTHHMMSSZ`, or non-ASCII / control characters in headers).
+pub fn authorization(input: &Signing<'_>) -> Option<String> {
     let Signing {
         method,
         path,
@@ -47,6 +48,14 @@ pub fn authorization(input: &Signing<'_>) -> String {
         service,
         amz_date,
     } = *input;
+    let well_formed = amz_date.len() == 16
+        && amz_date.is_ascii()
+        && amz_date.as_bytes()[8] == b'T'
+        && amz_date.ends_with('Z');
+    let clean = |t: &str| t.is_ascii() && !t.chars().any(|c| c.is_control());
+    if !well_formed || !headers.iter().all(|(k, v)| clean(k) && clean(v)) {
+        return None;
+    }
     let date = &amz_date[..8];
     let mut sorted: Vec<(String, String)> = headers
         .iter()
@@ -71,9 +80,9 @@ pub fn authorization(input: &Signing<'_>) -> String {
     let k_signing = hmac(&k_service, b"aws4_request");
     let signature = hex(&hmac(&k_signing, string_to_sign.as_bytes()));
 
-    format!(
+    Some(format!(
         "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -97,8 +106,29 @@ mod tests {
             amz_date: "20150830T123600Z",
         });
         assert_eq!(
-            auth,
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+            auth.as_deref(),
+            Some("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31")
         );
+    }
+
+    #[test]
+    fn malformed_input_returns_none_instead_of_panicking() {
+        let empty_sha = hex(&Sha256::digest(b""));
+        for bad_date in ["", "2015", "2015083", "€€€", "20150830X123600Z"] {
+            let r = authorization(&Signing {
+                method: "GET", path: "/", query: "",
+                headers: &[("Host", "example.amazonaws.com")],
+                payload_sha256_hex: &empty_sha, access_key: "A", secret_key: "S",
+                region: "us-east-1", service: "s", amz_date: bad_date,
+            });
+            assert!(r.is_none(), "{bad_date:?}");
+        }
+        let r = authorization(&Signing {
+            method: "GET", path: "/", query: "",
+            headers: &[("Host", "example.amazonaws.com"), ("x-Ünï", "v\r\nx")],
+            payload_sha256_hex: &empty_sha, access_key: "A", secret_key: "S",
+            region: "us-east-1", service: "s", amz_date: "20150830T123600Z",
+        });
+        assert!(r.is_none());
     }
 }
