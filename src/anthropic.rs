@@ -105,9 +105,30 @@ impl AnthropicProvider {
     }
 
     /// Uses your own `reqwest::Client`, for example to share a connection pool or set a proxy.
+    ///
+    /// **Security:** reqwest follows redirects by default and, on a redirect to another host,
+    /// strips only `Authorization`. Provider keys sent as `x-api-key` / `x-goog-api-key` would
+    /// then reach that host. Prefer [`with_client_builder`](Self::with_client_builder), which
+    /// turns redirects off. If you keep this method, build the client with
+    /// `.redirect(reqwest::redirect::Policy::none())`.
+    #[deprecated(since = "0.3.2", note = "use with_client_builder: a client that follows redirects can leak the key to another host")]
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        log::warn!(
+            "llm-universal: AnthropicProvider::with_client is deprecated: a client that follows redirects \
+             can leak the API key to another host; use with_client_builder"
+        );
         self.http.client = client;
         self
+    }
+
+    /// Uses your own `reqwest::ClientBuilder` (proxy, pool, TLS settings). Redirects are always
+    /// turned off, so the key is never sent to another host.
+    pub fn with_client_builder(mut self, builder: reqwest::ClientBuilder) -> crate::Result<Self> {
+        self.http.client = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(crate::LlmError::from_reqwest)?;
+        Ok(self)
     }
 
     /// How many times a failed request is retried (default [`DEFAULT_MAX_RETRIES`](crate::DEFAULT_MAX_RETRIES); 0 disables).

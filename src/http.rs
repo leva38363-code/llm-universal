@@ -61,7 +61,27 @@ impl Http {
             let this_try = request.try_clone().ok_or_else(|| {
                 LlmError::InvalidArgument("request body cannot be retried".into())
             })?;
-            let (error, retry_after, should_retry) = match this_try.send().await {
+            let built = this_try.build().map_err(LlmError::from_reqwest)?;
+            let origin = built.url().host_str().map(str::to_owned);
+            // Values of secret headers, so an error body that echoes them cannot leak the key.
+            let secrets: Vec<String> = built
+                .headers()
+                .values()
+                .filter(|v| v.is_sensitive())
+                .filter_map(|v| v.to_str().ok())
+                .map(|v| v.trim_start_matches("Bearer ").to_string())
+                .filter(|v| v.len() >= 8)
+                .collect();
+            let sent = self.client.execute(built).await;
+            if let Ok(response) = &sent {
+                // A client that follows redirects may have sent the request elsewhere.
+                if response.url().host_str().map(str::to_owned) != origin {
+                    return Err(LlmError::InvalidResponse(
+                        "the response came from another host (redirect); refusing it".into(),
+                    ));
+                }
+            }
+            let (error, retry_after, should_retry) = match sent {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) => {
                     let headers = response.headers().clone();
@@ -79,6 +99,7 @@ impl Http {
                         }
                         Err(error) => return Err(error),
                     };
+                    let text = secrets.iter().fold(text, |t, s| t.replace(s.as_str(), &mask_secret(s)));
                     let mut api = ApiError::from_response(status, request_id(&headers), &text);
                     api.retry_after = retry_after(&headers);
                     let should_retry =
@@ -126,6 +147,14 @@ fn request_id(headers: &HeaderMap) -> Option<String> {
 
 /// `retry-after-ms` (milliseconds) or `retry-after` (seconds or an HTTP date — only the
 /// seconds form is read), if within [`MAX_RETRY_AFTER`].
+/// `sk-SUPERSECRET-123` -> `sk-****23`: recognisable, but not usable.
+pub(crate) fn mask_secret(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    let head: String = chars.iter().take(3).collect();
+    let tail: String = chars[chars.len().saturating_sub(2)..].iter().collect();
+    format!("{head}****{tail}")
+}
+
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let delay = header("retry-after-ms")

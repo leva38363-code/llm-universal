@@ -121,7 +121,12 @@ fn parse_block(block: &str) -> Option<(String, String)> {
     (!data.is_empty()).then(|| (event, data.join("\n")))
 }
 
+/// A stream may stay open for long answers, but not on keep-alives alone: without a single
+/// data event for this long it is cut off (each keep-alive byte resets reqwest's idle timer).
+pub(crate) const MAX_SILENCE: std::time::Duration = std::time::Duration::from_secs(300);
+
 struct State {
+    last_event: std::time::Instant,
     response: reqwest::Response,
     parser: SseParser,
     acc: Box<dyn Accumulator>,
@@ -153,6 +158,7 @@ impl State {
 /// Turns an SSE response into a [`ChatStream`].
 pub(crate) fn drive(response: reqwest::Response, acc: Box<dyn Accumulator>) -> ChatStream {
     let state = State {
+        last_event: std::time::Instant::now(),
         response,
         parser: SseParser::default(),
         acc,
@@ -180,7 +186,18 @@ pub(crate) fn drive(response: reqwest::Response, acc: Box<dyn Accumulator>) -> C
                             continue;
                         }
                         match state.parser.push(&bytes) {
-                            Ok(events) => state.handle(events),
+                            Ok(events) if events.is_empty() => {
+                                if state.last_event.elapsed() > MAX_SILENCE {
+                                    state.fail(LlmError::InvalidResponse(format!(
+                                        "no stream events for {} s (keep-alives only)",
+                                        MAX_SILENCE.as_secs()
+                                    )));
+                                }
+                            }
+                            Ok(events) => {
+                                state.last_event = std::time::Instant::now();
+                                state.handle(events);
+                            }
                             Err(e) => state.fail(e),
                         }
                     }

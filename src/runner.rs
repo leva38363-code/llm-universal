@@ -5,6 +5,9 @@ use crate::{
     ToolCall,
 };
 
+/// Tool calls handled per round; extra calls get an error result instead of running.
+pub const MAX_CALLS_PER_ROUND: usize = 64;
+
 /// Runs the tool loop until the model gives a final answer.
 ///
 /// Each round sends `request`, calls `handler` for every tool call (in order) and sends the
@@ -62,12 +65,22 @@ where
             ));
         }
 
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
+        let declared: std::collections::HashSet<&str> =
+            request.tools.iter().map(|t| t.name.as_str()).collect();
+        let mut results = Vec::with_capacity(calls.len().min(MAX_CALLS_PER_ROUND));
+        for (i, call) in calls.into_iter().enumerate() {
             let id = call.id.clone();
-            let part = match handler(call).await {
-                Ok(content) => Part::tool_result(id, content, false),
-                Err(message) => Part::tool_result(id, message, true),
+            // Calls the request never declared, and calls beyond the per-round limit, are answered
+            // with an error instead of reaching the handler (a hostile server can send thousands).
+            let part = if i >= MAX_CALLS_PER_ROUND {
+                Part::tool_result(id, format!("too many tool calls in one round (limit {MAX_CALLS_PER_ROUND})"), true)
+            } else if !declared.contains(call.name.as_str()) {
+                Part::tool_result(id, format!("unknown tool: {}", call.name.chars().take(64).collect::<String>()), true)
+            } else {
+                match handler(call).await {
+                    Ok(content) => Part::tool_result(id, content, false),
+                    Err(message) => Part::tool_result(id, message, true),
+                }
             };
             results.push(part);
         }

@@ -54,7 +54,7 @@ pub use futures_util::StreamExt;
 pub use gemini::GeminiProvider;
 pub use http::DEFAULT_MAX_RETRIES;
 pub use openai::OpenAiProvider;
-pub use runner::run_tools;
+pub use runner::{run_tools, MAX_CALLS_PER_ROUND};
 pub use stream::{ChatStream, StreamEvent};
 pub use types::*;
 

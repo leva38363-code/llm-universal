@@ -559,3 +559,78 @@ async fn run_tools_stops_on_truncated_tool_call() {
         "the cut-off assistant turn is not left in history"
     );
 }
+
+/// Регрессия пентеста: редирект на чужой хост не уносит ключ, если клиент собран через with_client_builder.
+#[tokio::test]
+async fn redirect_to_other_host_does_not_carry_the_key() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // Хост B: считает входящие соединения.
+    let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_port = b.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits2 = hits.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = b.accept().await {
+            hits2.fetch_add(1, Ordering::SeqCst);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}").await;
+        }
+    });
+    // Хост A: отвечает 307 на B (другой хост: localhost против 127.0.0.1).
+    let location = format!("http://localhost:{b_port}/v1/messages");
+    let (base, _h) = serve(vec![(307, Box::leak(format!("location: {location}\r\n").into_boxed_str()), String::new())]).await;
+
+    let p = AnthropicProvider::new("SECRET-ANT")
+        .with_base_url(base)
+        .with_max_retries(0)
+        .with_client_builder(reqwest::Client::builder())
+        .unwrap();
+    let _ = p.chat(&ChatRequest::new("m").message(Message::user("hi"))).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "ключ ушёл на другой хост");
+}
+
+/// Регрессия пентеста: сервер возвращает ключ эхом в теле ошибки, а в текст ошибки он не попадает.
+#[tokio::test]
+async fn echoed_key_is_redacted_from_api_errors() {
+    let body = r#"{"error":{"message":"bad header Authorization: Bearer sk-SUPERSECRET-123","type":"invalid_request_error"}}"#;
+    let (base, _h) = one_shot(400, body).await;
+    let p = OpenAiProvider::new("sk-SUPERSECRET-123").with_base_url(base).with_max_retries(0);
+    let err = p.chat(&ChatRequest::new("m").message(Message::user("hi"))).await.unwrap_err();
+    let shown = format!("{err} {err:?}");
+    assert!(!shown.contains("sk-SUPERSECRET-123"), "{shown}");
+    assert!(shown.contains("sk-****23"), "{shown}");
+}
+
+/// Регрессия пентеста: сервер присылает 100 вызовов, часть с необъявленным именем.
+/// Обработчик видит не больше лимита за раунд и никогда не видит необъявленный инструмент.
+#[tokio::test]
+async fn hostile_tool_calls_are_capped_and_undeclared_names_rejected() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let mut blocks = Vec::new();
+    for i in 0..100 {
+        let name = if i % 2 == 0 { "get_weather" } else { "rm_rf" };
+        blocks.push(format!(r#"{{"type":"tool_use","id":"t{i}","name":"{name}","input":{{"city":"X"}}}}"#));
+    }
+    let call = format!(r#"{{"model":"m","content":[{}],"stop_reason":"tool_use"}}"#, blocks.join(","));
+    let done = r#"{"model":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#;
+    let (base, _server) = serve(vec![(200, "", call), (200, "", done.into())]).await;
+    let provider = AnthropicProvider::new("k").with_base_url(base);
+    let mut req = ChatRequest::new("m").tool(weather_tool()).message(Message::user("go"));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen2 = seen.clone();
+    run_tools(&provider, &mut req, 3, move |call| {
+        let seen = seen2.clone();
+        async move {
+            assert_eq!(call.name, "get_weather", "необъявленный инструмент дошёл до обработчика");
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok("ok".to_string())
+        }
+    })
+    .await
+    .unwrap();
+    let n = seen.load(Ordering::SeqCst);
+    assert!(n <= llm_universal::MAX_CALLS_PER_ROUND, "обработчик вызван {n} раз");
+}
