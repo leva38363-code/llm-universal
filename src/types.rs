@@ -308,6 +308,14 @@ pub struct Usage {
     pub output_tokens: u32,
 }
 
+impl std::ops::AddAssign for Usage {
+    /// Sums usage over several responses (for example, one chat session).
+    fn add_assign(&mut self, other: Usage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+    }
+}
+
 impl Usage {
     /// Cost in your currency, given prices per million input and output tokens.
     /// Prices change and differ per model, so they are passed in rather than built in.
@@ -388,4 +396,31 @@ pub struct ModelInfo {
 pub struct Embeddings {
     pub vectors: Vec<Vec<f32>>,
     pub usage: Usage,
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::Usage;
+
+    #[test]
+    fn usage_sums_across_responses() {
+        let mut total = Usage::default();
+        total += Usage { input_tokens: 100, output_tokens: 20 };
+        total += Usage { input_tokens: 50, output_tokens: 5 };
+        assert_eq!(total.input_tokens, 150);
+        assert_eq!(total.output_tokens, 25);
+    }
+
+    #[test]
+    fn cost_is_per_million() {
+        let u = Usage { input_tokens: 1_000_000, output_tokens: 500_000 };
+        assert!((u.cost(3.0, 15.0) - 10.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sum_saturates_instead_of_overflowing() {
+        let mut u = Usage { input_tokens: u32::MAX, output_tokens: 0 };
+        u += Usage { input_tokens: 10, output_tokens: 0 };
+        assert_eq!(u.input_tokens, u32::MAX);
+    }
 }
