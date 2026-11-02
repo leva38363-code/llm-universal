@@ -1,6 +1,6 @@
 [package]
 name = "llm-universal"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "One async client for Anthropic, OpenAI, Gemini, Cohere, Azure, Bedrock, Vertex AI and OpenAI-compatible APIs: streaming, tools, images, structured output, retries"
 license = "MIT-0"
