@@ -72,23 +72,6 @@ impl GeminiProvider {
         self
     }
 
-    /// Uses your own `reqwest::Client`, for example to share a connection pool or set a proxy.
-    ///
-    /// **Security:** reqwest follows redirects by default and, on a redirect to another host,
-    /// strips only `Authorization`. Provider keys sent as `x-api-key` / `x-goog-api-key` would
-    /// then reach that host. Prefer [`with_client_builder`](Self::with_client_builder), which
-    /// turns redirects off. If you keep this method, build the client with
-    /// `.redirect(reqwest::redirect::Policy::none())`.
-    #[deprecated(since = "0.3.2", note = "use with_client_builder: a client that follows redirects can leak the key to another host")]
-    pub fn with_client(mut self, client: reqwest::Client) -> Self {
-        log::warn!(
-            "llm-universal: GeminiProvider::with_client is deprecated: a client that follows redirects \
-             can leak the API key to another host; use with_client_builder"
-        );
-        self.http.client = client;
-        self
-    }
-
     /// Uses your own `reqwest::ClientBuilder` (proxy, pool, TLS settings). Redirects are always
     /// turned off, so the key is never sent to another host.
     pub fn with_client_builder(mut self, builder: reqwest::ClientBuilder) -> crate::Result<Self> {
@@ -102,6 +85,25 @@ impl GeminiProvider {
     /// How many times a failed request is retried (default [`DEFAULT_MAX_RETRIES`](crate::DEFAULT_MAX_RETRIES); 0 disables).
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.http.max_retries = max_retries;
+        self
+    }
+
+    /// Also repeat requests the server may already have processed (5xx, 408, 409, timeouts after
+    /// sending). Off by default: a repeat can generate and bill the answer twice.
+    pub fn with_repeat_post(mut self, repeat: bool) -> Self {
+        self.http.repeat_post = repeat;
+        self
+    }
+
+    /// Limit for one non-streaming attempt (default 600 s).
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.http.request_timeout = timeout;
+        self
+    }
+
+    /// Overall limit for a stream, including keep-alives (default 1 h).
+    pub fn with_stream_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.http.stream_deadline = deadline;
         self
     }
 
@@ -557,6 +559,7 @@ impl LlmProvider for GeminiProvider {
         Ok(stream::drive(
             response,
             Box::new(GeminiStream::new(Self::model_name(&req.model))),
+            self.http.stream_deadline,
         ))
     }
 

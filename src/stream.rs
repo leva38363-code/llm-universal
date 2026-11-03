@@ -126,6 +126,8 @@ fn parse_block(block: &str) -> Option<(String, String)> {
 pub(crate) const MAX_SILENCE: std::time::Duration = std::time::Duration::from_secs(300);
 
 struct State {
+    started: std::time::Instant,
+    deadline: std::time::Duration,
     last_event: std::time::Instant,
     response: reqwest::Response,
     parser: SseParser,
@@ -156,8 +158,14 @@ impl State {
 }
 
 /// Turns an SSE response into a [`ChatStream`].
-pub(crate) fn drive(response: reqwest::Response, acc: Box<dyn Accumulator>) -> ChatStream {
+pub(crate) fn drive(
+    response: reqwest::Response,
+    acc: Box<dyn Accumulator>,
+    deadline: std::time::Duration,
+) -> ChatStream {
     let state = State {
+        started: std::time::Instant::now(),
+        deadline,
         last_event: std::time::Instant::now(),
         response,
         parser: SseParser::default(),
@@ -175,6 +183,13 @@ pub(crate) fn drive(response: reqwest::Response, acc: Box<dyn Accumulator>) -> C
                 }
                 if state.finished {
                     return None;
+                }
+                if state.started.elapsed() > state.deadline {
+                    state.fail(LlmError::InvalidResponse(format!(
+                        "stream exceeded its {} s deadline",
+                        state.deadline.as_secs()
+                    )));
+                    continue;
                 }
                 match state.response.chunk().await {
                     Ok(Some(bytes)) => {

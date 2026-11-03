@@ -1,7 +1,7 @@
 //! Client-side argument validation before the request is sent.
 
 use llm_universal::{
-    AnthropicProvider, ChatRequest, LlmError, LlmProvider, Message, OpenAiProvider, Tool,
+    AnthropicProvider, ChatRequest, LlmError, LlmProvider, Message, OpenAiProvider, Part, Tool,
 };
 use serde_json::json;
 
@@ -146,4 +146,110 @@ async fn real_loopback_hosts_still_allowed_over_http() {
         let err = p.chat(&hi()).await.unwrap_err();
         assert!(!matches!(err, LlmError::InvalidArgument(_)), "{url}: {err}");
     }
+}
+
+#[tokio::test]
+async fn image_urls_must_be_https_and_not_local() {
+    for url in [
+        "http://example.com/a.png",
+        "https://127.0.0.1/a.png",
+        "https://10.0.0.5/a.png",
+        "https://169.254.169.254/latest/meta-data",
+        "https://localhost/a.png",
+        "https://printer.internal/a.png",
+        "https://[::1]/a.png",
+        "https://[fd00::1]/a.png",
+        "https://example.com\\@evil/a.png",
+    ] {
+        let p = OpenAiProvider::new("sk-x");
+        let req = ChatRequest::new("m").message(Message::user_with_image(
+            "что на картинке",
+            Part::image_url(url),
+        ));
+        let msg = invalid_args(&p, req).await;
+        assert!(msg.contains("image url"), "{url}: {msg}");
+    }
+}
+
+#[tokio::test]
+async fn public_https_image_url_is_accepted_by_validation() {
+    let p = OpenAiProvider::new("sk-x").with_base_url("http://127.0.0.1:9/v1").with_max_retries(0);
+    let req = ChatRequest::new("m").message(Message::user_with_image(
+        "что на картинке",
+        Part::image_url("https://images.example.com/cat.png"),
+    ));
+    let err = p.chat(&req).await.unwrap_err();
+    assert!(!matches!(err, LlmError::InvalidArgument(_)), "{err}");
+}
+
+#[tokio::test]
+async fn too_many_messages_are_refused_before_sending() {
+    let p = OpenAiProvider::new("sk-x");
+    let mut req = ChatRequest::new("m");
+    for _ in 0..1001 {
+        req = req.message(Message::user("x"));
+    }
+    let msg = invalid_args(&p, req).await;
+    assert!(msg.contains("too many messages"), "{msg}");
+}
+
+/// Регрессия: все локальные и приватные формы IPv6 (включая вложенный IPv4) отклоняются.
+#[tokio::test]
+async fn ipv6_local_and_embedded_ipv4_forms_are_refused() {
+    for url in [
+        "https://[::1]/a.png",
+        "https://[::]/a.png",
+        "https://[fe80::1]/a.png",
+        "https://[fec0::1]/a.png",
+        "https://[fd12:3456::1]/a.png",
+        "https://[ff02::1]/a.png",
+        "https://[::ffff:127.0.0.1]/a.png",
+        "https://[::ffff:10.0.0.5]/a.png",
+        "https://[::ffff:169.254.169.254]/a.png",
+        "https://[64:ff9b::7f00:1]/a.png",
+        "https://[64:ff9b::a9fe:a9fe]/a.png",
+        "https://[::7f00:1]/a.png",
+    ] {
+        let p = OpenAiProvider::new("sk-x");
+        let req = ChatRequest::new("m").message(Message::user_with_image(
+            "что на картинке",
+            Part::image_url(url),
+        ));
+        let msg = invalid_args(&p, req).await;
+        assert!(msg.contains("image url"), "{url}: {msg}");
+    }
+}
+
+/// Публичный IPv6 не должен отклоняться как локальный.
+#[tokio::test]
+async fn public_ipv6_image_url_is_accepted() {
+    let p = OpenAiProvider::new("sk-x").with_base_url("http://127.0.0.1:9/v1").with_max_retries(0);
+    let req = ChatRequest::new("m").message(Message::user_with_image(
+        "что на картинке",
+        Part::image_url("https://[2606:4700:4700::1111]/cat.png"),
+    ));
+    let err = p.chat(&req).await.unwrap_err();
+    assert!(!matches!(err, LlmError::InvalidArgument(_)), "{err}");
+}
+
+#[tokio::test]
+async fn wikipedia_and_mirrors_are_blocked_for_images() {
+    for url in [
+        "https://upload.wikimedia.org/wikipedia/commons/a/a9/Example.jpg",
+        "https://en.wikipedia.org/wiki/File:Example.jpg",
+        "https://ru.m.wikipedia.org/x.png",
+        "https://commons.wikimedia.org/x.png",
+        "https://www.wikiwand.com/x.png",
+        "https://UPLOAD.WIKIMEDIA.ORG/x.png",
+    ] {
+        let p = OpenAiProvider::new("sk-x");
+        let req = ChatRequest::new("m").message(Message::user_with_image("?", Part::image_url(url)));
+        let msg = invalid_args(&p, req).await;
+        assert!(msg.contains("blocked"), "{url}: {msg}");
+    }
+    // Похожий, но чужой домен не блокируется.
+    let p = OpenAiProvider::new("sk-x").with_base_url("http://127.0.0.1:9/v1").with_max_retries(0);
+    let req = ChatRequest::new("m").message(Message::user_with_image("?", Part::image_url("https://notwikipedia.org/x.png")));
+    let err = p.chat(&req).await.unwrap_err();
+    assert!(!matches!(err, LlmError::InvalidArgument(_)), "{err}");
 }

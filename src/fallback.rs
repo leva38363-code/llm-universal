@@ -9,6 +9,21 @@ use crate::{ChatRequest, ChatResponse, ChatStream, LlmError, LlmProvider, ModelI
 /// A chain of providers. Nothing changes unless you build one explicitly.
 pub struct FallbackProvider {
     providers: Vec<Box<dyn LlmProvider>>,
+    server_errors: bool,
+}
+
+/// Moving on is safe when the failed provider most likely did not process the request:
+/// the connection failed (`Connection`) or the server said "slow down" (429).
+/// A 5xx or a timeout may mean the answer was generated and billed, so the next provider
+/// would bill it again. Those go to the next provider only when `with_server_errors(true)`.
+fn may_fall_back(error: &LlmError, server_errors: bool) -> bool {
+    match error {
+        LlmError::Connection(_) => true,
+        LlmError::Api(e) if e.status == 429 => true,
+        LlmError::Api(e) if server_errors && e.status >= 500 => true,
+        LlmError::Timeout(_) => server_errors,
+        _ => false,
+    }
 }
 
 impl std::fmt::Debug for FallbackProvider {
@@ -25,8 +40,18 @@ impl FallbackProvider {
         if providers.is_empty() {
             None
         } else {
-            Some(Self { providers })
+            Some(Self {
+                providers,
+                server_errors: false,
+            })
         }
+    }
+
+    /// Also move to the next provider after 5xx and timeouts. Enable only when a second bill
+    /// for the same request is acceptable.
+    pub fn with_server_errors(mut self, enabled: bool) -> Self {
+        self.server_errors = enabled;
+        self
     }
 }
 
@@ -37,7 +62,7 @@ impl LlmProvider for FallbackProvider {
         for provider in &self.providers {
             match provider.chat(request).await {
                 Ok(response) => return Ok(response),
-                Err(e) if e.is_retryable() => last = Some(e),
+                Err(e) if may_fall_back(&e, self.server_errors) => last = Some(e),
                 Err(e) => return Err(e),
             }
         }
@@ -49,7 +74,7 @@ impl LlmProvider for FallbackProvider {
         for provider in &self.providers {
             match provider.chat_stream(request).await {
                 Ok(stream) => return Ok(stream),
-                Err(e) if e.is_retryable() => last = Some(e),
+                Err(e) if may_fall_back(&e, self.server_errors) => last = Some(e),
                 Err(e) => return Err(e),
             }
         }
@@ -61,7 +86,7 @@ impl LlmProvider for FallbackProvider {
         for provider in &self.providers {
             match provider.list_models().await {
                 Ok(models) => return Ok(models),
-                Err(e) if e.is_retryable() => last = Some(e),
+                Err(e) if may_fall_back(&e, self.server_errors) => last = Some(e),
                 Err(e) => return Err(e),
             }
         }
@@ -75,6 +100,16 @@ mod tests {
     use crate::{ApiError, ApiErrorKind, ChatResponse, Message, StopReason};
 
     struct Fake(Result<&'static str>);
+
+    /// Ошибка с заданным HTTP-статусом (Fake всегда отдаёт 503).
+    struct Status(u16);
+
+    #[async_trait]
+    impl LlmProvider for Status {
+        async fn chat(&self, _: &ChatRequest) -> Result<ChatResponse> {
+            Err(api(self.0))
+        }
+    }
 
     fn api(status: u16) -> LlmError {
         LlmError::Api(Box::new(ApiError {
@@ -115,8 +150,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_on_5xx() {
+    async fn falls_back_on_5xx_only_when_enabled() {
+        let p = FallbackProvider::new(vec![Box::new(Fake(Err(api(503)))), Box::new(Fake(Ok("второй")))])
+            .unwrap()
+            .with_server_errors(true);
+        assert_eq!(p.chat(&req()).await.unwrap().text(), "второй");
+    }
+
+    #[tokio::test]
+    async fn server_error_stops_chain_by_default() {
+        // По умолчанию 5xx не переводит на второго: первый мог уже выставить счёт.
         let p = FallbackProvider::new(vec![Box::new(Fake(Err(api(503)))), Box::new(Fake(Ok("второй")))]).unwrap();
+        assert!(matches!(p.chat(&req()).await, Err(LlmError::Api(e)) if e.status == 503));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_falls_back_by_default() {
+        let p = FallbackProvider::new(vec![Box::new(Status(429)), Box::new(Fake(Ok("второй")))]).unwrap();
         assert_eq!(p.chat(&req()).await.unwrap().text(), "второй");
     }
 

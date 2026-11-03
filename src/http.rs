@@ -26,6 +26,13 @@ const MAX_RETRY_DELAY: f64 = 8.0;
 pub(crate) struct Http {
     pub(crate) client: reqwest::Client,
     pub(crate) max_retries: u32,
+    /// Also repeat a POST that the server may have already processed (5xx, 408, 409, timeouts after
+    /// sending). Off by default: a repeat can generate and bill the answer twice.
+    pub(crate) repeat_post: bool,
+    /// Whole-request limit for non-streaming calls (each attempt).
+    pub(crate) request_timeout: Duration,
+    /// Overall limit for a stream, however much data arrives (keep-alives included).
+    pub(crate) stream_deadline: Duration,
 }
 
 impl Default for Http {
@@ -33,6 +40,9 @@ impl Default for Http {
         Self {
             client: default_client(),
             max_retries: DEFAULT_MAX_RETRIES,
+            repeat_post: false,
+            request_timeout: REQUEST_TIMEOUT,
+            stream_deadline: Duration::from_secs(3600),
         }
     }
 }
@@ -88,32 +98,43 @@ impl Http {
                     let status = response.status().as_u16();
                     let text = match read_body(response, MAX_ERROR_BYTES, true).await {
                         Ok(text) => text,
-                        // The error body itself broke off: treat it like a dropped connection.
-                        Err(error) if status >= 500 || status == 429 => {
-                            if attempt >= self.max_retries {
+                        Err(error) => {
+                            // The body broke off after the server answered: it may have processed the request.
+                            let retry = self.repeat_post && (status >= 500 || status == 429);
+                            if !retry || attempt >= self.max_retries {
                                 return Err(error);
                             }
                             tokio::time::sleep(retry_delay(attempt, None)).await;
                             attempt += 1;
                             continue;
                         }
-                        Err(error) => return Err(error),
                     };
                     let text = secrets.iter().fold(text, |t, s| t.replace(s.as_str(), &mask_secret(s)));
                     let mut api = ApiError::from_response(status, request_id(&headers), &text);
                     api.retry_after = retry_after(&headers);
-                    let should_retry =
-                        match headers.get("x-should-retry").and_then(|v| v.to_str().ok()) {
-                            Some("true") => true,
-                            Some("false") => false,
-                            _ => matches!(status, 408 | 409 | 429) || status >= 500,
-                        };
+                    let server_says = match headers.get("x-should-retry").and_then(|v| v.to_str().ok()) {
+                        Some("true") => Some(true),
+                        Some("false") => Some(false),
+                        _ => None,
+                    };
+                    // 429 means "not processed, try later": always safe to repeat.
+                    // 408/409/5xx may mean the request was processed: repeat only when asked for.
+                    let default_retry = status == 429
+                        || (self.repeat_post && (matches!(status, 408 | 409) || status >= 500));
+                    let should_retry = match server_says {
+                        Some(false) => false,
+                        Some(true) => status == 429 || self.repeat_post,
+                        None => default_retry,
+                    };
                     let retry_after = api.retry_after;
                     (LlmError::Api(Box::new(api)), retry_after, should_retry)
                 }
                 Err(e) => {
+                    // Connection failed before the request was sent: always safe to repeat.
+                    // Timeouts and other errors may come after sending: repeat only when asked for.
+                    let safe = e.is_connect();
                     let error = LlmError::from_reqwest(e);
-                    let retryable = error.is_retryable();
+                    let retryable = safe || (self.repeat_post && error.is_retryable());
                     (error, None, retryable)
                 }
             };
@@ -128,7 +149,7 @@ impl Http {
     /// Sends the request and parses a JSON body. Each attempt has a total time limit
     /// (streams only have the idle read timeout, so long answers are not cut off).
     pub(crate) async fn json(&self, request: reqwest::RequestBuilder) -> Result<Value> {
-        let response = self.send(request.timeout(REQUEST_TIMEOUT)).await?;
+        let response = self.send(request.timeout(self.request_timeout)).await?;
         let text = read_body(response, MAX_RESPONSE_BYTES, false).await?;
         serde_json::from_str(&text).map_err(|source| LlmError::Deserialize {
             source,

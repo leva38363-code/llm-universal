@@ -180,6 +180,13 @@ let chain = FallbackProvider::new(vec![
 ]).expect("at least one provider");
 ```
 
+## Reliability
+
+- Retries: connection failures and `429` are retried by default. A `5xx` or timeout is **not** retried by default, because the server may already have generated and billed the answer. Enable with `.with_repeat_post(true)` only when repeating the same request is safe.
+- Time limits: `.with_request_timeout(..)` for one non-streaming attempt (default 10 min), `.with_stream_deadline(..)` for a whole stream (default 1 h).
+- Fallback: `FallbackProvider` moves to the next provider on a dropped connection or `429`. Use `.with_server_errors(true)` to also move on `5xx` and timeouts.
+- Images by URL must be `https://` and public: local and private addresses are refused.
+
 ## Errors
 
 | `LlmError` variant | When | SDK equivalent |

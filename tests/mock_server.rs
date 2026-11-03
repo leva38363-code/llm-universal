@@ -311,13 +311,96 @@ async fn retries_429_honoring_retry_after_then_succeeds() {
         (200, "", ok.into()),
     ])
     .await;
+    // 503 повторяется только по явному разрешению: сервер мог уже обработать запрос.
     let resp = OpenAiProvider::new("k")
         .with_base_url(base)
+        .with_repeat_post(true)
         .chat(&ChatRequest::new("gpt-4o").message(Message::user("x")))
         .await
         .unwrap();
     assert_eq!(server.await.unwrap().len(), 3);
     assert_eq!(resp.text(), "hi");
+}
+
+/// По умолчанию 5xx не повторяется: один запрос, ошибка сразу.
+#[tokio::test]
+async fn server_error_is_not_repeated_by_default() {
+    let (base, server) = serve(vec![
+        (503, "", "".into()),
+        (200, "", r#"{"model":"m","choices":[{"finish_reason":"stop","message":{"content":"x"}}]}"#.into()),
+    ])
+    .await;
+    let r = OpenAiProvider::new("k")
+        .with_base_url(base)
+        .with_max_retries(3)
+        .chat(&ChatRequest::new("m").message(Message::user("x")))
+        .await;
+    assert!(r.is_err());
+    server.abort();
+}
+
+/// Таймаут запроса задаётся явно и срабатывает на молчащем сервере.
+#[tokio::test]
+async fn request_timeout_is_configurable() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let _h = tokio::spawn(async move {
+        loop {
+            if let Ok((s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    drop(s);
+                });
+            }
+        }
+    });
+    let started = std::time::Instant::now();
+    let r = OpenAiProvider::new("k")
+        .with_base_url(base)
+        .with_max_retries(0)
+        .with_request_timeout(std::time::Duration::from_millis(200))
+        .chat(&ChatRequest::new("m").message(Message::user("x")))
+        .await;
+    assert!(matches!(r, Err(LlmError::Timeout(_))), "{r:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// Дедлайн стрима: сервер шлёт только keep-alive каждые 50 мс, без событий.
+#[tokio::test]
+async fn stream_deadline_cuts_keepalive_only_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = s.read(&mut buf).await;
+        let _ = s
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+            .await;
+        for _ in 0..200 {
+            if s.write_all(b":\n\n").await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
+    let started = std::time::Instant::now();
+    let stream = OpenAiProvider::new("k")
+        .with_base_url(base)
+        .with_stream_deadline(std::time::Duration::from_millis(300))
+        .chat_stream(&ChatRequest::new("m").message(Message::user("x")))
+        .await
+        .unwrap();
+    let mut stream = stream;
+    let mut failed = false;
+    while let Some(event) = stream.next().await {
+        if event.is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "стрим должен оборваться по дедлайну");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
 
 #[tokio::test]

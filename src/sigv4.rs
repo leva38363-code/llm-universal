@@ -59,14 +59,15 @@ pub fn authorization(input: &Signing<'_>) -> Option<String> {
     let date = &amz_date[..8];
     let mut sorted: Vec<(String, String)> = headers
         .iter()
-        .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string()))
+        .map(|(k, v)| (k.to_ascii_lowercase(), collapse_spaces(v)))
         .collect();
     sorted.sort();
     let canonical_headers: String = sorted.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
     let signed_headers = sorted.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
 
+    let canonical_query = canonical_query(query);
     let canonical_request = format!(
-        "{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_sha256_hex}"
+        "{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_sha256_hex}"
     );
     let scope = format!("{date}/{region}/{service}/aws4_request");
     let string_to_sign = format!(
@@ -83,6 +84,30 @@ pub fn authorization(input: &Signing<'_>) -> Option<String> {
     Some(format!(
         "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
     ))
+}
+
+/// AWS: trim, and replace runs of spaces inside a header value with one space.
+fn collapse_spaces(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// AWS: query parameters sorted by name, then by value; `key=value` pairs kept as given
+/// (the caller must already percent-encode them as AWS requires).
+fn canonical_query(query: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<(&str, &str)> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split_once('=').unwrap_or((p, "")))
+        .collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 #[cfg(test)]
@@ -130,5 +155,12 @@ mod tests {
             region: "us-east-1", service: "s", amz_date: "20150830T123600Z",
         });
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn query_is_sorted_and_header_spaces_collapsed() {
+        assert_eq!(canonical_query("b=2&a=1&a=0"), "a=0&a=1&b=2");
+        assert_eq!(canonical_query(""), "");
+        assert_eq!(collapse_spaces("  a   b\tc  "), "a b c");
     }
 }

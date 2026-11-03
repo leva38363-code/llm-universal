@@ -36,6 +36,8 @@
 
 mod anthropic;
 mod cohere;
+mod budget;
+mod commands;
 mod error;
 mod fallback;
 mod gemini;
@@ -48,6 +50,8 @@ mod types;
 
 pub use anthropic::AnthropicProvider;
 pub use cohere::CohereProvider;
+pub use budget::{Budget, Limits};
+pub use commands::Commands;
 pub use error::{ApiError, ApiErrorKind, LlmError};
 pub use fallback::FallbackProvider;
 pub use futures_util::StreamExt;
@@ -198,6 +202,14 @@ pub(crate) fn validate(
     req: &ChatRequest,
 ) -> Result<()> {
     validate_endpoint(provider, api_key, require_key, base_url)?;
+    if req.messages.len() > MAX_MESSAGES {
+        return Err(invalid(format!("too many messages: {} (limit {MAX_MESSAGES})", req.messages.len())));
+    }
+    let text_bytes: usize = req.system.as_deref().map_or(0, str::len)
+        + req.messages.iter().map(|m| m.text_content().len()).sum::<usize>();
+    if text_bytes > MAX_TEXT_BYTES {
+        return Err(invalid(format!("request text is {text_bytes} bytes (limit {MAX_TEXT_BYTES})")));
+    }
     if req.model.trim().is_empty() {
         return Err(invalid("model must not be empty".to_string()));
     }
@@ -282,12 +294,107 @@ pub(crate) fn validate(
     Ok(())
 }
 
+/// True for addresses that point at this machine or at a private network, IPv4 or IPv6.
+/// IPv6 forms that embed an IPv4 address (mapped `::ffff:a.b.c.d`, NAT64 `64:ff9b::/96`,
+/// the deprecated IPv4-compatible `::a.b.c.d`) are checked as the IPv4 address they carry.
+pub(crate) fn is_local_address(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+                || v4.is_broadcast() || v4.octets()[0] == 0 || v4.octets()[0] >= 240
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_local_address(IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            let nat64 = seg[0] == 0x64 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0;
+            if nat64 {
+                let [a, b] = [(seg[6] >> 8) as u8, seg[6] as u8];
+                let [c, d] = [(seg[7] >> 8) as u8, seg[7] as u8];
+                return is_local_address(IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)));
+            }
+            let compat = seg[..6].iter().all(|&x| x == 0) && (seg[6] != 0 || seg[7] > 1);
+            if compat {
+                let [a, b] = [(seg[6] >> 8) as u8, seg[6] as u8];
+                let [c, d] = [(seg[7] >> 8) as u8, seg[7] as u8];
+                return is_local_address(IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (seg[0] & 0xffc0) == 0xfec0 // site-local fec0::/10 (deprecated)
+                || (seg[0] & 0xff00) == 0xff00 // multicast ff00::/8
+        }
+    }
+}
+
+/// Image hosts that are refused: Wikimedia projects and known Wikipedia mirrors.
+/// Subdomains are matched too (`en.wikipedia.org`, `upload.wikimedia.org`).
+pub const BLOCKED_IMAGE_HOSTS: &[&str] = &[
+    "wikipedia.org",
+    "wikimedia.org",
+    "wikimediafoundation.org",
+    "mediawiki.org",
+    "wikidata.org",
+    "wiktionary.org",
+    "wikibooks.org",
+    "wikiquote.org",
+    "wikisource.org",
+    "wikinews.org",
+    "wikiversity.org",
+    "wikivoyage.org",
+    "wikifunctions.org",
+    "wikiwand.com",
+    "wikizero.com",
+    "wiki2.org",
+    "wikiless.org",
+    "wikimirror.com",
+];
+
+/// Longest image URL accepted.
+const MAX_IMAGE_URL_BYTES: usize = 2048;
+/// Most messages in one request.
+const MAX_MESSAGES: usize = 1000;
+/// Most text in one request, in bytes (all messages and the system prompt together).
+const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
+
 fn validate_image(i: usize, source: &ImageSource) -> Result<()> {
     match source {
         ImageSource::Url { url } => {
-            if !url.starts_with("https://") && !url.starts_with("http://") {
+            // The provider fetches this URL itself. Only https, and never a literal private or
+            // local address, so a user-supplied URL cannot point the provider at internal services.
+            if !url.starts_with("https://") {
                 return Err(invalid(format!(
-                    "messages[{i}]: image url must start with http:// or https://"
+                    "messages[{i}]: image url must start with https://"
+                )));
+            }
+            if url.len() > MAX_IMAGE_URL_BYTES || url.chars().any(|c| c.is_control() || c == '\\' || c == ' ') {
+                return Err(invalid(format!("messages[{i}]: image url is too long or malformed")));
+            }
+            let authority = url["https://".len()..].split(['/', '?', '#']).next().unwrap_or_default();
+            let hostport = authority.rsplit('@').next().unwrap_or_default();
+            // IPv6 literal in brackets: take what is inside; otherwise drop the port.
+            let host = match hostport.strip_prefix('[') {
+                Some(inner) => inner.split(']').next().unwrap_or_default(),
+                None => hostport.split(':').next().unwrap_or_default(),
+            };
+            let local_name = host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") || host.ends_with(".internal");
+            let private_ip = host.parse::<std::net::IpAddr>().map(is_local_address).unwrap_or(false);
+            if local_name || private_ip {
+                return Err(invalid(format!(
+                    "messages[{i}]: image url points to a local or private address"
+                )));
+            }
+            let host_lc = host.to_ascii_lowercase();
+            if BLOCKED_IMAGE_HOSTS
+                .iter()
+                .any(|d| host_lc == *d || host_lc.ends_with(&format!(".{d}")))
+            {
+                return Err(invalid(format!(
+                    "messages[{i}]: image url host `{host_lc}` is blocked (Wikipedia, Wikimedia and their mirrors)"
                 )));
             }
         }
