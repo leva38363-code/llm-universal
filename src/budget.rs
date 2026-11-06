@@ -56,6 +56,12 @@ fn today_entry(spent: &mut HashMap<String, Spent>, user: &str, day: u64) -> Spen
     *entry
 }
 
+/// True when `cost` is at or over `max`, or when the two cannot be compared (NaN), so an
+/// unusable cost refuses requests instead of letting them through.
+fn cost_limit_reached(cost: f64, max: f64) -> bool {
+    cost.partial_cmp(&max) != Some(std::cmp::Ordering::Less)
+}
+
 /// Drops users whose spending belongs to an earlier day and who have nothing in flight.
 fn evict_old(spent: &mut HashMap<String, Spent>, day: u64) {
     spent.retain(|_, s| s.day == day || s.reserved > 0);
@@ -101,8 +107,7 @@ impl Budget {
                 limits.max_tokens
             )));
         }
-        // NaN fails this comparison too, so an unusable cost refuses requests.
-        if !(current.cost < limits.max_cost) {
+        if cost_limit_reached(current.cost, limits.max_cost) {
             return Err(LlmError::BudgetExceeded(
                 "daily cost limit reached for this user".into(),
             ));
@@ -132,7 +137,7 @@ impl Budget {
                 current.tokens, limits.max_tokens
             )));
         }
-        if !(current.cost < limits.max_cost) {
+        if cost_limit_reached(current.cost, limits.max_cost) {
             return Err(LlmError::BudgetExceeded(
                 "daily cost limit reached for this user".into(),
             ));
