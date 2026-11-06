@@ -444,8 +444,12 @@ pub(crate) fn usage(u: &Value, input: &str, output: &str) -> Usage {
     Usage {
         input_tokens: tokens(input),
         output_tokens: tokens(output),
+        ..Default::default()
     }
 }
+
+/// Most tool calls kept from one streamed response.
+const MAX_STREAMED_TOOL_CALLS: usize = 256;
 
 /// Builds the non-streaming response shape from `chat.completion.chunk` events.
 #[derive(Default)]
@@ -503,6 +507,11 @@ impl Accumulator for OpenAiStream {
         }
         for call in delta["tool_calls"].as_array().into_iter().flatten() {
             let index = call["index"].as_u64().unwrap_or(0);
+            if !self.calls.contains_key(&index) && self.calls.len() >= MAX_STREAMED_TOOL_CALLS {
+                return Err(LlmError::InvalidResponse(format!(
+                    "more than {MAX_STREAMED_TOOL_CALLS} tool calls in one response"
+                )));
+            }
             let entry = self.calls.entry(index).or_default();
             if let Some(id) = call["id"].as_str().filter(|s| !s.is_empty()) {
                 entry.0 = id.to_string();
@@ -596,7 +605,12 @@ impl LlmProvider for OpenAiProvider {
             .request(reqwest::Method::POST, "/chat/completions")?
             .json(&body);
         let response = self.http.send(builder).await?;
-        Ok(stream::drive(response, Box::<OpenAiStream>::default(), self.http.stream_deadline))
+        Ok(stream::drive(
+            response,
+            Box::<OpenAiStream>::default(),
+            self.http.stream_deadline,
+            vec![self.api_key.clone()],
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>> {

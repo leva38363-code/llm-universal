@@ -560,6 +560,7 @@ impl LlmProvider for GeminiProvider {
             response,
             Box::new(GeminiStream::new(Self::model_name(&req.model))),
             self.http.stream_deadline,
+            vec![self.api_key.clone()],
         ))
     }
 

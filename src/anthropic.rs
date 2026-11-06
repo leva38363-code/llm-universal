@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::http::{secret_header, Http};
-use crate::openai::{parse_arguments, usage};
+use crate::openai::parse_arguments;
 use crate::stream::{self, parse_data, Accumulator, ChatStream, StreamEvent};
+use crate::Usage;
 use crate::{
     ApiError, ChatRequest, ChatResponse, ImageSource, LlmError, LlmProvider, Message, ModelInfo,
     Part, Result, Role, StopReason, DEFAULT_MAX_TOKENS,
@@ -367,8 +368,22 @@ fn parse_response(v: &Value) -> Result<ChatResponse> {
         model: v["model"].as_str().unwrap_or_default().to_string(),
         message: Message::new(Role::Assistant, parts),
         stop_reason,
-        usage: usage(&v["usage"], "input_tokens", "output_tokens"),
+        usage: anthropic_usage(&v["usage"]),
     })
+}
+
+/// Most content blocks kept from one streamed message.
+const MAX_CONTENT_BLOCKS: usize = 256;
+
+/// Anthropic reports `input_tokens` without the cache counters, so they are read separately.
+fn anthropic_usage(u: &Value) -> Usage {
+    let tokens = |field: &str| u32::try_from(u[field].as_u64().unwrap_or(0)).unwrap_or(u32::MAX);
+    Usage {
+        input_tokens: tokens("input_tokens"),
+        output_tokens: tokens("output_tokens"),
+        cache_read_tokens: tokens("cache_read_input_tokens"),
+        cache_write_tokens: tokens("cache_creation_input_tokens"),
+    }
 }
 
 /// Rebuilds the non-streaming message from `message_start` / `content_block_*` /
@@ -385,7 +400,8 @@ struct AnthropicStream {
 impl Accumulator for AnthropicStream {
     fn on_event(&mut self, _event: &str, data: &str) -> Result<Vec<StreamEvent>> {
         let v = parse_data(data)?;
-        let index = v["index"].as_u64().unwrap_or(0);
+        // Block events must say which block they belong to; checked in each arm below.
+        let index = v["index"].as_u64().unwrap_or(u64::MAX);
         let mut out = Vec::new();
         match v["type"].as_str() {
             Some("message_start") => {
@@ -397,6 +413,9 @@ impl Accumulator for AnthropicStream {
                 self.message = v["message"].clone();
             }
             Some("content_block_start") => {
+                if index == u64::MAX {
+                    return Err(LlmError::InvalidResponse("content block event without an index".into()));
+                }
                 let block = v["content_block"].clone();
                 if !block.is_object() {
                     return Err(LlmError::InvalidResponse(
@@ -410,9 +429,15 @@ impl Accumulator for AnthropicStream {
                     });
                     self.tool_json.insert(index, String::new());
                 }
+                if !self.blocks.contains_key(&index) && self.blocks.len() >= MAX_CONTENT_BLOCKS {
+                    return Err(LlmError::InvalidResponse(format!("more than {MAX_CONTENT_BLOCKS} content blocks")));
+                }
                 self.blocks.insert(index, block);
             }
             Some("content_block_delta") => {
+                if index == u64::MAX {
+                    return Err(LlmError::InvalidResponse("content block event without an index".into()));
+                }
                 let delta = &v["delta"];
                 let Some(block) = self.blocks.get_mut(&index) else {
                     return Ok(out);
@@ -447,6 +472,9 @@ impl Accumulator for AnthropicStream {
                 }
             }
             Some("content_block_stop") => {
+                if index == u64::MAX {
+                    return Err(LlmError::InvalidResponse("content block event without an index".into()));
+                }
                 if let (Some(json), Some(block)) =
                     (self.tool_json.remove(&index), self.blocks.get_mut(&index))
                 {
@@ -509,7 +537,12 @@ impl LlmProvider for AnthropicProvider {
     async fn chat_stream(&self, req: &ChatRequest) -> Result<ChatStream> {
         let builder = self.chat_request(req, true)?;
         let response = self.http.send(builder).await?;
-        Ok(stream::drive(response, Box::<AnthropicStream>::default(), self.http.stream_deadline))
+        Ok(stream::drive(
+            response,
+            Box::<AnthropicStream>::default(),
+            self.http.stream_deadline,
+            vec![self.api_key.clone()],
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>> {
@@ -721,7 +754,10 @@ mod regression_tests {
 
     #[test]
     fn cache_system_marks_system_block() {
-        let req = ChatRequest::new("m").system("длинный промпт").cache_system().message(Message::user("hi"));
+        let req = ChatRequest::new("m")
+            .system("длинный промпт")
+            .cache_system()
+            .message(Message::user("hi"));
         let body = AnthropicProvider::build_body(&req);
         assert_eq!(body["system"][0]["type"], "text");
         assert_eq!(body["system"][0]["text"], "длинный промпт");
@@ -730,8 +766,39 @@ mod regression_tests {
 
     #[test]
     fn system_is_plain_string_by_default() {
-        let req = ChatRequest::new("m").system("sys").message(Message::user("hi"));
+        let req = ChatRequest::new("m")
+            .system("sys")
+            .message(Message::user("hi"));
         let body = AnthropicProvider::build_body(&req);
         assert_eq!(body["system"], "sys");
     }
 }
+
+#[cfg(test)]
+mod cache_and_index_tests {
+    use super::*;
+
+    #[test]
+    fn cache_counters_are_read_separately_from_input() {
+        let u = anthropic_usage(&serde_json::json!({
+            "input_tokens": 30,
+            "output_tokens": 7,
+            "cache_read_input_tokens": 50_000,
+            "cache_creation_input_tokens": 1_000
+        }));
+        assert_eq!(u.input_tokens, 30);
+        assert_eq!(u.cache_read_tokens, 50_000);
+        assert_eq!(u.cache_write_tokens, 1_000);
+        assert_eq!(u.output_tokens, 7);
+    }
+
+    #[test]
+    fn block_event_without_index_is_an_error() {
+        let mut acc = AnthropicStream::default();
+        let err = acc
+            .on_event("", r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}"#)
+            .unwrap_err();
+        assert!(matches!(err, LlmError::InvalidResponse(_)), "{err}");
+    }
+}
+

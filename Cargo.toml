@@ -23,5 +23,8 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["time"] }
 
+[features]
+fuzzing = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }

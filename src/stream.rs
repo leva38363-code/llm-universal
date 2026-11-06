@@ -135,6 +135,36 @@ struct State {
     queue: VecDeque<Result<StreamEvent>>,
     read: usize,
     finished: bool,
+    /// The API key and other secrets, masked in error text the provider echoes back.
+    secrets: Vec<String>,
+}
+
+fn deadline_error(deadline: std::time::Duration) -> LlmError {
+    LlmError::InvalidResponse(format!(
+        "stream exceeded its {} s deadline",
+        deadline.as_secs()
+    ))
+}
+
+fn silence_error() -> LlmError {
+    LlmError::InvalidResponse(format!(
+        "no stream events for {} s (keep-alives only)",
+        MAX_SILENCE.as_secs()
+    ))
+}
+
+/// Masks secrets in an error that came from the stream.
+fn redact_error(error: LlmError, secrets: &[String]) -> LlmError {
+    match error {
+        LlmError::Api(mut api) => {
+            crate::error::redact_api_error(&mut api, secrets);
+            LlmError::Api(api)
+        }
+        LlmError::InvalidResponse(message) => {
+            LlmError::InvalidResponse(crate::http::redact(&message, secrets))
+        }
+        other => other,
+    }
 }
 
 impl State {
@@ -143,7 +173,7 @@ impl State {
             match self.acc.on_event(&event, &data) {
                 Ok(out) => self.queue.extend(out.into_iter().map(Ok)),
                 Err(e) => {
-                    self.queue.push_back(Err(e));
+                    self.queue.push_back(Err(redact_error(e, &self.secrets)));
                     self.finished = true;
                     return;
                 }
@@ -162,6 +192,7 @@ pub(crate) fn drive(
     response: reqwest::Response,
     acc: Box<dyn Accumulator>,
     deadline: std::time::Duration,
+    secrets: Vec<String>,
 ) -> ChatStream {
     let state = State {
         started: std::time::Instant::now(),
@@ -173,6 +204,7 @@ pub(crate) fn drive(
         queue: VecDeque::new(),
         read: 0,
         finished: false,
+        secrets,
     };
     Box::pin(futures_util::stream::unfold(
         state,
@@ -184,14 +216,27 @@ pub(crate) fn drive(
                 if state.finished {
                     return None;
                 }
-                if state.started.elapsed() > state.deadline {
-                    state.fail(LlmError::InvalidResponse(format!(
-                        "stream exceeded its {} s deadline",
-                        state.deadline.as_secs()
-                    )));
+                let elapsed = state.started.elapsed();
+                if elapsed > state.deadline {
+                    state.fail(deadline_error(state.deadline));
                     continue;
                 }
-                match state.response.chunk().await {
+                // Wait for the next chunk, but no longer than the deadline or the silence limit.
+                let silence_left = MAX_SILENCE.saturating_sub(state.last_event.elapsed());
+                let wait = (state.deadline - elapsed).min(silence_left);
+                let next = match tokio::time::timeout(wait, state.response.chunk()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        let error = if state.started.elapsed() > state.deadline {
+                            deadline_error(state.deadline)
+                        } else {
+                            silence_error()
+                        };
+                        state.fail(error);
+                        continue;
+                    }
+                };
+                match next {
                     Ok(Some(bytes)) => {
                         state.read += bytes.len();
                         if state.read > MAX_RESPONSE_BYTES {
@@ -203,10 +248,7 @@ pub(crate) fn drive(
                         match state.parser.push(&bytes) {
                             Ok(events) if events.is_empty() => {
                                 if state.last_event.elapsed() > MAX_SILENCE {
-                                    state.fail(LlmError::InvalidResponse(format!(
-                                        "no stream events for {} s (keep-alives only)",
-                                        MAX_SILENCE.as_secs()
-                                    )));
+                                    state.fail(silence_error());
                                 }
                             }
                             Ok(events) => {
@@ -226,7 +268,7 @@ pub(crate) fn drive(
                             state.finished = true;
                         }
                     }
-                    Err(e) => state.fail(LlmError::from_reqwest(e)),
+                    Err(e) => state.fail(LlmError::after_send(e)),
                 }
             }
         },
@@ -237,7 +279,7 @@ pub(crate) fn drive(
 pub(crate) fn parse_data(data: &str) -> Result<serde_json::Value> {
     serde_json::from_str(data).map_err(|source| LlmError::Deserialize {
         source,
-        content: crate::error::truncate(data),
+        content: crate::error::BodySnippet::new(data),
     })
 }
 
@@ -298,5 +340,25 @@ mod tests {
         let mut p = SseParser::default();
         let big = vec![b'x'; MAX_EVENT_BYTES + 1];
         assert!(p.push(&big).is_err());
+    }
+}
+
+/// Fuzzing entry point (feature `fuzzing`): feeds `data` to the SSE parser in two pieces split
+/// at `split` and parses every payload as JSON. Not part of the public API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_sse(data: &[u8], split: usize) {
+    let mut parser = SseParser::default();
+    let split = split.min(data.len());
+    let mut events = Vec::new();
+    if let Ok(ev) = parser.push(&data[..split]) {
+        events.extend(ev);
+    }
+    if let Ok(ev) = parser.push(&data[split..]) {
+        events.extend(ev);
+    }
+    events.extend(parser.flush());
+    for (_, payload) in events {
+        let _ = parse_data(&payload);
     }
 }

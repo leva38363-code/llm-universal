@@ -19,6 +19,7 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// Everything needed to sign one request.
 pub struct Signing<'a> {
     pub method: &'a str,
+    /// The raw request path, not percent-encoded: it is encoded here as AWS requires.
     pub path: &'a str,
     pub query: &'a str,
     /// Must include `host` and `x-amz-date`; names are lowercased and sorted here.
@@ -53,7 +54,21 @@ pub fn authorization(input: &Signing<'_>) -> Option<String> {
         && amz_date.as_bytes()[8] == b'T'
         && amz_date.ends_with('Z');
     let clean = |t: &str| t.is_ascii() && !t.chars().any(|c| c.is_control());
-    if !well_formed || !headers.iter().all(|(k, v)| clean(k) && clean(v)) {
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let token = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    // Access key ids are alphanumeric; anything else (`,`, `/`, spaces) would change the
+    // Authorization header's structure.
+    let key_ok = !access_key.is_empty()
+        && access_key.len() <= 128
+        && access_key.bytes().all(|b| b.is_ascii_alphanumeric());
+    if !well_formed
+        || !digits(&amz_date[..8])
+        || !digits(&amz_date[9..15])
+        || !key_ok
+        || !token(region)
+        || !token(service)
+        || !headers.iter().all(|(k, v)| clean(k) && clean(v))
+    {
         return None;
     }
     let date = &amz_date[..8];
@@ -63,11 +78,16 @@ pub fn authorization(input: &Signing<'_>) -> Option<String> {
         .collect();
     sorted.sort();
     let canonical_headers: String = sorted.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
-    let signed_headers = sorted.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let signed_headers = sorted
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
 
     let canonical_query = canonical_query(query);
     let canonical_request = format!(
-        "{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_sha256_hex}"
+        "{method}\n{}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_sha256_hex}",
+        canonical_uri(path, service)
     );
     let scope = format!("{date}/{region}/{service}/aws4_request");
     let string_to_sign = format!(
@@ -84,6 +104,36 @@ pub fn authorization(input: &Signing<'_>) -> Option<String> {
     Some(format!(
         "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
     ))
+}
+
+/// AWS: each path segment is percent-encoded (unreserved characters `A-Z a-z 0-9 - _ . ~` kept);
+/// every service except S3 encodes it a second time, so `:` in a Bedrock model id becomes `%253A`.
+fn canonical_uri(path: &str, service: &str) -> String {
+    if path.is_empty() {
+        return "/".to_string();
+    }
+    let encode = |s: &str| -> String {
+        s.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    };
+    path.split('/')
+        .map(|segment| {
+            let once = encode(segment);
+            if service == "s3" {
+                once
+            } else {
+                encode(&once)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// AWS: trim, and replace runs of spaces inside a header value with one space.
@@ -122,7 +172,10 @@ mod tests {
             method: "GET",
             path: "/",
             query: "",
-            headers: &[("Host", "example.amazonaws.com"), ("X-Amz-Date", "20150830T123600Z")],
+            headers: &[
+                ("Host", "example.amazonaws.com"),
+                ("X-Amz-Date", "20150830T123600Z"),
+            ],
             payload_sha256_hex: &empty_sha,
             access_key: "AKIDEXAMPLE",
             secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
@@ -137,22 +190,61 @@ mod tests {
     }
 
     #[test]
+    fn canonical_uri_encodes_segments_and_double_encodes_outside_s3() {
+        assert_eq!(canonical_uri("/", "bedrock"), "/");
+        assert_eq!(canonical_uri("/model/anthropic.claude-v2:1/invoke", "bedrock"), "/model/anthropic.claude-v2%253A1/invoke");
+        assert_eq!(canonical_uri("/bucket/a b", "s3"), "/bucket/a%20b");
+    }
+
+    #[test]
+    fn unsafe_access_key_or_region_is_refused() {
+        let empty_sha = hex(&Sha256::digest(b""));
+        for (key, region) in [("AK,ID", "us-east-1"), ("AK/ID", "us-east-1"), ("AKID", "us east"), ("", "us-east-1")] {
+            let r = authorization(&Signing {
+                method: "GET",
+                path: "/",
+                query: "",
+                headers: &[("Host", "example.amazonaws.com")],
+                payload_sha256_hex: &empty_sha,
+                access_key: key,
+                secret_key: "S",
+                region,
+                service: "s",
+                amz_date: "20150830T123600Z",
+            });
+            assert!(r.is_none(), "{key:?} {region:?}");
+        }
+    }
+
+    #[test]
     fn malformed_input_returns_none_instead_of_panicking() {
         let empty_sha = hex(&Sha256::digest(b""));
         for bad_date in ["", "2015", "2015083", "€€€", "20150830X123600Z"] {
             let r = authorization(&Signing {
-                method: "GET", path: "/", query: "",
+                method: "GET",
+                path: "/",
+                query: "",
                 headers: &[("Host", "example.amazonaws.com")],
-                payload_sha256_hex: &empty_sha, access_key: "A", secret_key: "S",
-                region: "us-east-1", service: "s", amz_date: bad_date,
+                payload_sha256_hex: &empty_sha,
+                access_key: "A",
+                secret_key: "S",
+                region: "us-east-1",
+                service: "s",
+                amz_date: bad_date,
             });
             assert!(r.is_none(), "{bad_date:?}");
         }
         let r = authorization(&Signing {
-            method: "GET", path: "/", query: "",
+            method: "GET",
+            path: "/",
+            query: "",
             headers: &[("Host", "example.amazonaws.com"), ("x-Ünï", "v\r\nx")],
-            payload_sha256_hex: &empty_sha, access_key: "A", secret_key: "S",
-            region: "us-east-1", service: "s", amz_date: "20150830T123600Z",
+            payload_sha256_hex: &empty_sha,
+            access_key: "A",
+            secret_key: "S",
+            region: "us-east-1",
+            service: "s",
+            amz_date: "20150830T123600Z",
         });
         assert!(r.is_none());
     }

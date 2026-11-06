@@ -35,8 +35,8 @@
 #![warn(missing_debug_implementations)]
 
 mod anthropic;
-mod cohere;
 mod budget;
+mod cohere;
 mod commands;
 mod error;
 mod fallback;
@@ -49,8 +49,8 @@ mod stream;
 mod types;
 
 pub use anthropic::AnthropicProvider;
-pub use cohere::CohereProvider;
 pub use budget::{Budget, Limits};
+pub use cohere::CohereProvider;
 pub use commands::Commands;
 pub use error::{ApiError, ApiErrorKind, LlmError};
 pub use fallback::FallbackProvider;
@@ -59,6 +59,9 @@ pub use gemini::GeminiProvider;
 pub use http::DEFAULT_MAX_RETRIES;
 pub use openai::OpenAiProvider;
 pub use runner::{run_tools, MAX_CALLS_PER_ROUND};
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use stream::fuzz_sse;
 pub use stream::{ChatStream, StreamEvent};
 pub use types::*;
 
@@ -114,7 +117,10 @@ fn checked_host<'a>(provider: &str, base_url: &'a str) -> Result<&'a str> {
                 "{provider}: base_url must start with http:// or https://"
             ))
         })?;
-    if base_url.chars().any(|c| c == '\\' || c.is_whitespace() || c.is_control()) {
+    if base_url
+        .chars()
+        .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+    {
         return Err(invalid(format!(
             "{provider}: base_url must not contain backslashes, spaces or control characters"
         )));
@@ -203,12 +209,21 @@ pub(crate) fn validate(
 ) -> Result<()> {
     validate_endpoint(provider, api_key, require_key, base_url)?;
     if req.messages.len() > MAX_MESSAGES {
-        return Err(invalid(format!("too many messages: {} (limit {MAX_MESSAGES})", req.messages.len())));
+        return Err(invalid(format!(
+            "too many messages: {} (limit {MAX_MESSAGES})",
+            req.messages.len()
+        )));
     }
     let text_bytes: usize = req.system.as_deref().map_or(0, str::len)
-        + req.messages.iter().map(|m| m.text_content().len()).sum::<usize>();
+        + req
+            .messages
+            .iter()
+            .map(|m| m.text_content().len())
+            .sum::<usize>();
     if text_bytes > MAX_TEXT_BYTES {
-        return Err(invalid(format!("request text is {text_bytes} bytes (limit {MAX_TEXT_BYTES})")));
+        return Err(invalid(format!(
+            "request text is {text_bytes} bytes (limit {MAX_TEXT_BYTES})"
+        )));
     }
     if req.model.trim().is_empty() {
         return Err(invalid("model must not be empty".to_string()));
@@ -301,15 +316,27 @@ pub(crate) fn is_local_address(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
-                || v4.is_broadcast() || v4.octets()[0] == 0 || v4.octets()[0] >= 240
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64) // CGNAT 100.64.0.0/10
+                || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18) // benchmarking 198.18.0.0/15
+                || v4.octets()[0] == 0
+                || v4.octets()[0] >= 240
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_local_address(IpAddr::V4(v4));
             }
             let seg = v6.segments();
-            let nat64 = seg[0] == 0x64 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0;
+            let nat64 = seg[0] == 0x64
+                && seg[1] == 0xff9b
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0;
             if nat64 {
                 let [a, b] = [(seg[6] >> 8) as u8, seg[6] as u8];
                 let [c, d] = [(seg[7] >> 8) as u8, seg[7] as u8];
@@ -371,30 +398,46 @@ fn validate_image(i: usize, source: &ImageSource) -> Result<()> {
                     "messages[{i}]: image url must start with https://"
                 )));
             }
-            if url.len() > MAX_IMAGE_URL_BYTES || url.chars().any(|c| c.is_control() || c == '\\' || c == ' ') {
-                return Err(invalid(format!("messages[{i}]: image url is too long or malformed")));
+            if url.len() > MAX_IMAGE_URL_BYTES
+                || url.chars().any(|c| c.is_control() || c == '\\' || c == ' ')
+            {
+                return Err(invalid(format!(
+                    "messages[{i}]: image url is too long or malformed"
+                )));
             }
-            let authority = url["https://".len()..].split(['/', '?', '#']).next().unwrap_or_default();
-            let hostport = authority.rsplit('@').next().unwrap_or_default();
-            // IPv6 literal in brackets: take what is inside; otherwise drop the port.
-            let host = match hostport.strip_prefix('[') {
-                Some(inner) => inner.split(']').next().unwrap_or_default(),
-                None => hostport.split(':').next().unwrap_or_default(),
-            };
-            let local_name = host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") || host.ends_with(".internal");
-            let private_ip = host.parse::<std::net::IpAddr>().map(is_local_address).unwrap_or(false);
+            // Parse the URL the way the provider will, so IPv4 forms such as `2130706433`,
+            // `0x7f.1` or `127.1` become the address they stand for before the check.
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|_| invalid(format!("messages[{i}]: image url is not a valid URL")))?;
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(invalid(format!(
+                    "messages[{i}]: image url must not contain credentials"
+                )));
+            }
+            let raw_host = parsed.host_str().unwrap_or_default();
+            // IPv6 literals come back in brackets.
+            let bare = raw_host.trim_start_matches('[').trim_end_matches(']');
+            // A trailing dot names the same host (`localhost.`, `en.wikipedia.org.`).
+            let host = bare.trim_end_matches('.').to_ascii_lowercase();
+            let local_name = host.is_empty()
+                || host == "localhost"
+                || host.ends_with(".localhost")
+                || host.ends_with(".internal");
+            let private_ip = bare
+                .parse::<std::net::IpAddr>()
+                .map(is_local_address)
+                .unwrap_or(false);
             if local_name || private_ip {
                 return Err(invalid(format!(
                     "messages[{i}]: image url points to a local or private address"
                 )));
             }
-            let host_lc = host.to_ascii_lowercase();
             if BLOCKED_IMAGE_HOSTS
                 .iter()
-                .any(|d| host_lc == *d || host_lc.ends_with(&format!(".{d}")))
+                .any(|d| host == *d || host.ends_with(&format!(".{d}")))
             {
                 return Err(invalid(format!(
-                    "messages[{i}]: image url host `{host_lc}` is blocked (Wikipedia, Wikimedia and their mirrors)"
+                    "messages[{i}]: image url host `{host}` is blocked (Wikipedia, Wikimedia and their mirrors)"
                 )));
             }
         }

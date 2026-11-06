@@ -301,6 +301,7 @@ impl LlmProvider for CohereProvider {
                 done: false,
             }),
             self.http.stream_deadline,
+            vec![self.api_key.clone()],
         ))
     }
 

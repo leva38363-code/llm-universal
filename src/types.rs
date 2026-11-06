@@ -313,8 +313,15 @@ pub enum StopReason {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
+    /// Input tokens that were not read from or written to a prompt cache.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Input tokens read from a prompt cache (Anthropic `cache_read_input_tokens`).
+    /// Billed at 0.1x the input price.
+    pub cache_read_tokens: u32,
+    /// Input tokens written to a prompt cache (Anthropic `cache_creation_input_tokens`).
+    /// Billed at 1.25x the input price.
+    pub cache_write_tokens: u32,
 }
 
 impl std::ops::AddAssign for Usage {
@@ -322,16 +329,36 @@ impl std::ops::AddAssign for Usage {
     fn add_assign(&mut self, other: Usage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
     }
 }
 
 impl Usage {
+    /// All tokens that count against a token limit: input (cached or not), output.
+    pub fn total_tokens(&self) -> u64 {
+        u64::from(self.input_tokens)
+            + u64::from(self.cache_read_tokens)
+            + u64::from(self.cache_write_tokens)
+            + u64::from(self.output_tokens)
+    }
+
     /// Cost in your currency, given prices per million input and output tokens.
-    /// Prices change and differ per model, so they are passed in rather than built in.
+    /// Cache reads are priced at 0.1x and cache writes at 1.25x the input price (Anthropic's
+    /// multipliers; OpenAI cached tokens are already part of `input_tokens`, so leave the cache
+    /// fields at 0 for them). Prices change and differ per model, so they are passed in rather
+    /// than built in. A NaN or infinite result means the prices were not usable.
     pub fn cost(&self, input_per_million: f64, output_per_million: f64) -> f64 {
-        (f64::from(self.input_tokens) * input_per_million
-            + f64::from(self.output_tokens) * output_per_million)
+        (f64::from(self.input_tokens)
+            + f64::from(self.cache_read_tokens) * 0.1
+            + f64::from(self.cache_write_tokens) * 1.25)
+            * input_per_million
             / 1_000_000.0
+            + f64::from(self.output_tokens) * output_per_million / 1_000_000.0
     }
 }
 
@@ -388,7 +415,7 @@ impl ChatResponse {
         let text = self.text();
         serde_json::from_str(&text).map_err(|source| LlmError::Deserialize {
             source,
-            content: crate::error::truncate(&text),
+            content: crate::error::BodySnippet::new(&text),
         })
     }
 }
@@ -414,22 +441,53 @@ mod usage_tests {
     #[test]
     fn usage_sums_across_responses() {
         let mut total = Usage::default();
-        total += Usage { input_tokens: 100, output_tokens: 20 };
-        total += Usage { input_tokens: 50, output_tokens: 5 };
+        total += Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..Default::default()
+        };
+        total += Usage {
+            input_tokens: 50,
+            output_tokens: 5,
+            ..Default::default()
+        };
         assert_eq!(total.input_tokens, 150);
         assert_eq!(total.output_tokens, 25);
     }
 
     #[test]
     fn cost_is_per_million() {
-        let u = Usage { input_tokens: 1_000_000, output_tokens: 500_000 };
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            ..Default::default()
+        };
         assert!((u.cost(3.0, 15.0) - 10.5).abs() < 1e-9);
     }
 
     #[test]
+    fn cache_tokens_are_priced_by_anthropic_multipliers() {
+        let u = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 1_000_000,
+            cache_write_tokens: 1_000_000,
+        };
+        // 1.0 * 0.1 + 1.0 * 1.25 = 1.35 million input-price units
+        assert!((u.cost(10.0, 0.0) - 13.5).abs() < 1e-9);
+        assert_eq!(u.total_tokens(), 2_000_000);
+    }
+
+    #[test]
     fn sum_saturates_instead_of_overflowing() {
-        let mut u = Usage { input_tokens: u32::MAX, output_tokens: 0 };
-        u += Usage { input_tokens: 10, output_tokens: 0 };
+        let mut u = Usage {
+            input_tokens: u32::MAX,
+            ..Default::default()
+        };
+        u += Usage {
+            input_tokens: 10,
+            ..Default::default()
+        };
         assert_eq!(u.input_tokens, u32::MAX);
     }
 }

@@ -253,3 +253,22 @@ async fn wikipedia_and_mirrors_are_blocked_for_images() {
     let err = p.chat(&req).await.unwrap_err();
     assert!(!matches!(err, LlmError::InvalidArgument(_)), "{err}");
 }
+
+#[tokio::test]
+async fn image_url_bypass_forms_are_refused() {
+    for url in [
+        "https://2130706433/x.png",      // 127.0.0.1 as one integer
+        "https://0x7f.1/x.png",          // 127.0.0.1 with hex octet
+        "https://127.1/x.png",           // 127.0.0.1 short form
+        "https://localhost./x.png",      // trailing dot
+        "https://127.0.0.1./x.png",      // trailing dot on an IP
+        "https://en.wikipedia.org./x.png", // trailing dot defeats the block list
+        "https://100.64.0.1/x.png",      // carrier-grade NAT
+        "https://user:pw@example.com/x.png", // credentials in the URL
+    ] {
+        let p = OpenAiProvider::new("sk-x");
+        let req = ChatRequest::new("m").message(Message::user_with_image("?", Part::image_url(url)));
+        let msg = invalid_args(&p, req).await;
+        assert!(!msg.is_empty(), "{url} should be refused");
+    }
+}

@@ -12,6 +12,10 @@ use crate::{LlmError, Result};
 pub(crate) const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 /// Largest error response body that is kept (64 KiB); the rest is dropped.
 const MAX_ERROR_BYTES: usize = 64 * 1024;
+/// Extra bytes read past the error limit, so a secret cut at the limit is still masked.
+const MAX_SECRET_SPAN: usize = 1024;
+/// Shorter secrets are not masked in bodies: they would match ordinary text.
+const MIN_SECRET_LEN: usize = 4;
 /// Retries by default, like the official SDKs.
 pub const DEFAULT_MAX_RETRIES: u32 = 2;
 /// A `retry-after` longer than this is ignored in favor of normal backoff (SDK behavior).
@@ -57,7 +61,14 @@ fn default_client() -> reqwest::Client {
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(8)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        // Building with these options practically never fails; if it does, keep the redirect
+        // policy and the post-send host check rather than falling back to the default client.
+        .unwrap_or_else(|_| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
 }
 
 impl Http {
@@ -80,7 +91,7 @@ impl Http {
                 .filter(|v| v.is_sensitive())
                 .filter_map(|v| v.to_str().ok())
                 .map(|v| v.trim_start_matches("Bearer ").to_string())
-                .filter(|v| v.len() >= 8)
+                .filter(|v| v.len() >= MIN_SECRET_LEN)
                 .collect();
             let sent = self.client.execute(built).await;
             if let Ok(response) = &sent {
@@ -96,27 +107,29 @@ impl Http {
                 Ok(response) => {
                     let headers = response.headers().clone();
                     let status = response.status().as_u16();
-                    let text = match read_body(response, MAX_ERROR_BYTES, true).await {
-                        Ok(text) => text,
-                        Err(error) => {
-                            // The body broke off after the server answered: it may have processed the request.
-                            let retry = self.repeat_post && (status >= 500 || status == 429);
-                            if !retry || attempt >= self.max_retries {
-                                return Err(error);
+                    let text =
+                        match read_body(response, MAX_ERROR_BYTES + MAX_SECRET_SPAN, true).await {
+                            Ok(text) => text,
+                            Err(error) => {
+                                // The body broke off after the server answered: it may have processed the request.
+                                let retry = self.repeat_post && (status >= 500 || status == 429);
+                                if !retry || attempt >= self.max_retries {
+                                    return Err(error);
+                                }
+                                tokio::time::sleep(retry_delay(attempt, None)).await;
+                                attempt += 1;
+                                continue;
                             }
-                            tokio::time::sleep(retry_delay(attempt, None)).await;
-                            attempt += 1;
-                            continue;
-                        }
-                    };
-                    let text = secrets.iter().fold(text, |t, s| t.replace(s.as_str(), &mask_secret(s)));
+                        };
+                    let text = cut_at_char(&redact(&text, &secrets), MAX_ERROR_BYTES).to_string();
                     let mut api = ApiError::from_response(status, request_id(&headers), &text);
                     api.retry_after = retry_after(&headers);
-                    let server_says = match headers.get("x-should-retry").and_then(|v| v.to_str().ok()) {
-                        Some("true") => Some(true),
-                        Some("false") => Some(false),
-                        _ => None,
-                    };
+                    let server_says =
+                        match headers.get("x-should-retry").and_then(|v| v.to_str().ok()) {
+                            Some("true") => Some(true),
+                            Some("false") => Some(false),
+                            _ => None,
+                        };
                     // 429 means "not processed, try later": always safe to repeat.
                     // 408/409/5xx may mean the request was processed: repeat only when asked for.
                     let default_retry = status == 429
@@ -133,7 +146,7 @@ impl Http {
                     // Connection failed before the request was sent: always safe to repeat.
                     // Timeouts and other errors may come after sending: repeat only when asked for.
                     let safe = e.is_connect();
-                    let error = LlmError::from_reqwest(e);
+                    let error = LlmError::after_send(e);
                     let retryable = safe || (self.repeat_post && error.is_retryable());
                     (error, None, retryable)
                 }
@@ -153,7 +166,7 @@ impl Http {
         let text = read_body(response, MAX_RESPONSE_BYTES, false).await?;
         serde_json::from_str(&text).map_err(|source| LlmError::Deserialize {
             source,
-            content: error::truncate(&text),
+            content: error::BodySnippet::new(&text),
         })
     }
 }
@@ -171,9 +184,37 @@ fn request_id(headers: &HeaderMap) -> Option<String> {
 /// `sk-SUPERSECRET-123` -> `sk-****23`: recognisable, but not usable.
 pub(crate) fn mask_secret(secret: &str) -> String {
     let chars: Vec<char> = secret.chars().collect();
+    if chars.len() < 8 {
+        // Showing any part of a short secret would reveal most of it.
+        return "****".to_string();
+    }
     let head: String = chars.iter().take(3).collect();
     let tail: String = chars[chars.len().saturating_sub(2)..].iter().collect();
     format!("{head}****{tail}")
+}
+
+/// Replaces every secret of at least [`MIN_SECRET_LEN`] bytes in `text`, longest first.
+pub(crate) fn redact(text: &str, secrets: &[String]) -> String {
+    let mut secrets: Vec<&String> = secrets
+        .iter()
+        .filter(|s| s.len() >= MIN_SECRET_LEN)
+        .collect();
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    secrets.into_iter().fold(text.to_string(), |t, s| {
+        t.replace(s.as_str(), &mask_secret(s))
+    })
+}
+
+/// The longest prefix of `text` that is at most `max` bytes and ends on a character boundary.
+pub(crate) fn cut_at_char(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -212,7 +253,7 @@ pub(crate) async fn read_body(
         return Err(too_large());
     }
     let mut buf = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(LlmError::from_reqwest)? {
+    while let Some(chunk) = response.chunk().await.map_err(LlmError::after_send)? {
         if buf.len() + chunk.len() > cap {
             if !truncate {
                 return Err(too_large());
@@ -260,5 +301,31 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("retry-after", HeaderValue::from_static("3600"));
         assert_eq!(retry_after(&h), None);
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn echoed_keys_are_masked_including_short_ones() {
+        let secrets = vec!["sk-SECRET-12345".to_string(), "abcd".to_string()];
+        let out = redact("key sk-SECRET-12345 and abcd came back", &secrets);
+        assert!(!out.contains("SECRET"), "{out}");
+        assert!(!out.contains("abcd"), "{out}");
+    }
+
+    #[test]
+    fn short_secrets_show_nothing_of_themselves() {
+        assert_eq!(mask_secret("abcd"), "****");
+        assert_eq!(mask_secret("sk-SECRET-12345"), "sk-****45");
+    }
+
+    #[test]
+    fn cut_never_splits_a_character() {
+        let s = "aé"; // 'é' is two bytes
+        assert_eq!(cut_at_char(s, 2), "a");
+        assert_eq!(cut_at_char(s, 3), "aé");
     }
 }

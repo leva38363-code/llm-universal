@@ -165,7 +165,7 @@ pub enum LlmError {
     Deserialize {
         #[source]
         source: serde_json::Error,
-        content: String,
+        content: BodySnippet,
     },
     /// The JSON parsed but is missing expected fields.
     #[error("unexpected api response: {0}")]
@@ -173,6 +173,9 @@ pub enum LlmError {
     /// Client-side validation before the request is sent (`InvalidArgument` in async-openai).
     #[error("invalid args: {0}")]
     InvalidArgument(String),
+    /// A per-user spending limit from [`crate::Budget`] was reached. Nothing was sent.
+    #[error("{0}")]
+    BudgetExceeded(String),
 }
 
 impl LlmError {
@@ -191,6 +194,23 @@ impl LlmError {
         } else {
             Self::Connection(error)
         }
+    }
+
+    /// Maps an error from reading or sending a request whose bytes may already have reached the
+    /// server. Only a failure to connect is a `Connection` (safe to retry or fall back). Anything
+    /// later may mean the request was processed, so it is `InvalidResponse`, which is neither
+    /// retried nor passed to another provider.
+    pub(crate) fn after_send(error: reqwest::Error) -> Self {
+        if error.is_builder() || error.is_connect() {
+            return Self::from_reqwest(error);
+        }
+        let error = error.without_url();
+        if error.is_timeout() {
+            return Self::Timeout(error);
+        }
+        Self::InvalidResponse(format!(
+            "connection broke after the request was sent: {error}"
+        ))
     }
 
     /// HTTP status, if the server answered.
@@ -221,4 +241,62 @@ impl LlmError {
 
 pub(crate) fn truncate(text: &str) -> String {
     text.chars().take(MAX_BODY_CHARS).collect()
+}
+
+/// Start of a response body that failed to parse. `Debug` shows only its length, so model output
+/// does not reach logs through `{:?}`. Read the text with [`BodySnippet::as_str`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct BodySnippet(String);
+
+impl BodySnippet {
+    pub(crate) fn new(text: &str) -> Self {
+        Self(truncate(text))
+    }
+
+    /// The first characters of the body.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for BodySnippet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BodySnippet(<{} bytes withheld>)", self.0.len())
+    }
+}
+
+/// Replaces each secret in an error's text fields and body with its masked form.
+pub(crate) fn redact_api_error(error: &mut ApiError, secrets: &[String]) {
+    let redact = |s: &str| crate::http::redact(s, secrets);
+    error.message = error.message.as_deref().map(redact);
+    error.error_type = error.error_type.as_deref().map(redact);
+    error.code = error.code.as_deref().map(redact);
+    error.param = error.param.as_deref().map(redact);
+    error.body = error.body.take().map(|v| {
+        let text = redact(&v.to_string());
+        serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text))
+    });
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn stream_error_text_and_body_are_masked() {
+        let key = "sk-LIVE-KEY-999";
+        let payload = serde_json::json!({"type": "error", "message": format!("bad key {key}")});
+        let mut err = ApiError::from_stream_error(&payload);
+        redact_api_error(&mut err, &[key.to_string()]);
+        assert!(!err.message.unwrap().contains(key));
+        assert!(!err.body.unwrap().to_string().contains(key));
+    }
+
+    #[test]
+    fn deserialize_debug_withholds_the_body() {
+        let content = BodySnippet::new("model output that must not be logged");
+        let debug = format!("{content:?}");
+        assert!(!debug.contains("model output"), "{debug}");
+        assert_eq!(content.as_str(), "model output that must not be logged");
+    }
 }

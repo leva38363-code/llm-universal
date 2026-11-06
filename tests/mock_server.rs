@@ -181,7 +181,7 @@ async fn html_instead_of_json_is_reported() {
         .unwrap_err();
     server.await.unwrap();
     match &err {
-        LlmError::Deserialize { content, .. } => assert_eq!(content, "<html>login</html>"),
+        LlmError::Deserialize { content, .. } => assert_eq!(content.as_str(), "<html>login</html>"),
         other => panic!("expected Deserialize, got {other:?}"),
     }
     // The body is kept in the error but never printed.
