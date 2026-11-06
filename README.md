@@ -2,9 +2,6 @@
 
 [![crates.io](https://img.shields.io/crates/v/llm-universal.svg)](https://crates.io/crates/llm-universal) [![CI](https://github.com/leva38363-code/llm-universal/actions/workflows/ci.yml/badge.svg)](https://github.com/leva38363-code/llm-universal/actions/workflows/ci.yml) [![License: MIT-0](https://img.shields.io/badge/license-MIT--0-blue.svg)](LICENSE)
 
-One async Rust client for many LLM APIs. Write your chat, streaming and tool-calling code once and
-switch providers by switching the constructor.
-
 | Provider | Constructor | API |
 |---|---|---|
 | Anthropic (Claude) | `AnthropicProvider::new(key)` | Messages API |

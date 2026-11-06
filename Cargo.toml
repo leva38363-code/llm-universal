@@ -3,7 +3,6 @@ name = "llm-universal"
 version = "0.4.0-beta.1"
 edition = "2021"
 rust-version = "1.85"
-description = "One async client for Anthropic, OpenAI, Gemini, Cohere, Azure, Bedrock, Vertex AI and OpenAI-compatible APIs: streaming, tools, images, structured output, retries"
 license = "MIT-0"
 readme = "README.md"
 keywords = ["llm", "openai", "anthropic", "gemini", "ai"]
