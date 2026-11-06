@@ -60,6 +60,9 @@ pub use http::DEFAULT_MAX_RETRIES;
 pub use openai::OpenAiProvider;
 pub use runner::{run_tools, MAX_CALLS_PER_ROUND};
 pub use stream::{ChatStream, StreamEvent};
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use stream::fuzz_sse;
 pub use types::*;
 
 use async_trait::async_trait;

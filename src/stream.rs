@@ -300,3 +300,23 @@ mod tests {
         assert!(p.push(&big).is_err());
     }
 }
+
+/// Fuzzing entry point (feature `fuzzing`): feeds `data` to the SSE parser in two pieces split
+/// at `split` and parses every payload as JSON. Not part of the public API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_sse(data: &[u8], split: usize) {
+    let mut parser = SseParser::default();
+    let split = split.min(data.len());
+    let mut events = Vec::new();
+    if let Ok(ev) = parser.push(&data[..split]) {
+        events.extend(ev);
+    }
+    if let Ok(ev) = parser.push(&data[split..]) {
+        events.extend(ev);
+    }
+    events.extend(parser.flush());
+    for (_, payload) in events {
+        let _ = parse_data(&payload);
+    }
+}
